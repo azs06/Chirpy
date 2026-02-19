@@ -79,15 +79,13 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 		w.Write([]byte("Metrics reset\n"))
 	})
 
-	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body string `json:"body"`
+			Body   string    `json:"body"`
+			UserId uuid.UUID `json:"user_id"`
 		}
 		type errResp struct {
 			Error string `json:"error"`
-		}
-		type succResp struct {
-			Cleaned_Body string `json:"cleaned_body"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -111,11 +109,35 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 			w.Write(dat)
 			return
 		}
+		chirpParam := database.CreateChirpParams{
+			Body: sql.NullString{
+				String: sanitize(params.Body),
+				Valid:  true,
+			},
+			UserID: params.UserId,
+		}
+		chirp, err := cfg.db.CreateChirp(r.Context(), chirpParam)
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+		type chirpResp struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserId    string    `json:"user_id"`
+		}
 
-		w.WriteHeader(200)
-		dat, _ := json.Marshal(succResp{
-			Cleaned_Body: sanitize(params.Body),
+		dat, _ := json.Marshal(chirpResp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt.Time,
+			UpdatedAt: chirp.UpdatedAt.Time,
+			Body:      chirp.Body.String,
+			UserId:    chirp.UserID.String(),
 		})
+		w.WriteHeader(201)
 		w.Write(dat)
 	})
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
