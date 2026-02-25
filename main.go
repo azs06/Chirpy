@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/azs06/Chirpy/internal/auth"
 	"github.com/azs06/Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -22,6 +23,20 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+}
+type chirpResp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    string    `json:"user_id"`
+}
+
+type userResp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -122,13 +137,6 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 			w.WriteHeader(500)
 			return
 		}
-		type chirpResp struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Body      string    `json:"body"`
-			UserId    string    `json:"user_id"`
-		}
 
 		dat, _ := json.Marshal(chirpResp{
 			ID:        chirp.ID,
@@ -140,9 +148,72 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 		w.WriteHeader(201)
 		w.Write(dat)
 	})
+	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		chirps, err := cfg.db.GetChirps(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+
+		type chirp struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserId    string    `json:"user_id"`
+		}
+		chirpResp := []chirp{}
+
+		for _, c := range chirps {
+			chirpResp = append(chirpResp, chirp{
+				ID:        c.ID,
+				CreatedAt: c.CreatedAt.Time,
+				UpdatedAt: c.UpdatedAt.Time,
+				Body:      c.Body.String,
+				UserId:    c.UserID.String(),
+			})
+		}
+		dat, _ := json.Marshal(chirpResp)
+		w.WriteHeader(200)
+		w.Write(dat)
+
+	})
+
+	mux.HandleFunc("GET /api/chirps/{chirpId}", func(w http.ResponseWriter, r *http.Request) {
+		chirpId := r.PathValue("chirpId")
+		chirpUUId, err := uuid.Parse(chirpId)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			fmt.Println(err)
+			w.Write([]byte(err.Error()))
+			w.WriteHeader(500)
+			return
+		}
+
+		chirp, err := cfg.db.GetChirpByID(r.Context(), chirpUUId)
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(404)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		dat, _ := json.Marshal(chirpResp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt.Time,
+			UpdatedAt: chirp.UpdatedAt.Time,
+			Body:      chirp.Body.String,
+			UserId:    chirp.UserID.String(),
+		})
+		w.WriteHeader(200)
+		w.Write(dat)
+
+	})
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 		type errResp struct {
 			Error string `json:"error"`
@@ -155,22 +226,25 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 			w.WriteHeader(500)
 			return
 		}
-		user, err := cfg.db.CreateUser(r.Context(), sql.NullString{
-			String: params.Email,
-			Valid:  params.Email != "",
-		})
-
+		hPassword, err := auth.HashPassword(params.Password)
 		if err != nil {
 			fmt.Println(err)
 			w.WriteHeader(500)
 			return
 		}
+		userData := database.CreateUserParams{
+			Email: sql.NullString{
+				String: params.Email,
+				Valid:  params.Email != "",
+			},
+			HashedPassword: hPassword,
+		}
+		user, err := cfg.db.CreateUser(r.Context(), userData)
 
-		type userResp struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
 		}
 
 		dat, _ := json.Marshal(userResp{
@@ -183,6 +257,42 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 		w.WriteHeader(201)
 		w.Write(dat)
 
+	})
+
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+
+		user, err := cfg.db.GetUserByEmail(r.Context(), sql.NullString{
+			String: params.Email,
+			Valid:  params.Email != "",
+		})
+
+		match, err := auth.CheckHashedPassword(params.Password, user.HashedPassword)
+		if !match {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		dat, _ := json.Marshal(userResp{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt.Time,
+			UpdatedAt: user.UpdatedAt.Time,
+			Email:     user.Email.String,
+		})
+		w.Write(dat)
+		w.WriteHeader(http.StatusOK)
 	})
 	return &http.Server{
 		Addr:    ":" + p,
