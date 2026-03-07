@@ -23,6 +23,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	tokenSecret    string
 }
 type chirpResp struct {
 	ID        uuid.UUID `json:"id"`
@@ -33,10 +34,12 @@ type chirpResp struct {
 }
 
 type userResp struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -96,16 +99,29 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body   string    `json:"body"`
-			UserId uuid.UUID `json:"user_id"`
+			Body string `json:"body"`
 		}
 		type errResp struct {
 			Error string `json:"error"`
 		}
 
+		bearerToken, err := auth.GetBearerToken(r.Header)
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		userId, err := auth.ValidateJWT(bearerToken, cfg.tokenSecret)
+
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
-		err := decoder.Decode(&params)
+		err = decoder.Decode(&params)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			dat, _ := json.Marshal(errResp{
@@ -129,7 +145,7 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 				String: sanitize(params.Body),
 				Valid:  true,
 			},
-			UserID: params.UserId,
+			UserID: userId,
 		}
 		chirp, err := cfg.db.CreateChirp(r.Context(), chirpParam)
 		if err != nil {
@@ -261,9 +277,13 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 
 	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email    string `json:"email"`
-			Password string `json:"password"`
+			Email            string `json:"email"`
+			Password         string `json:"password"`
+			ExpiresInSeconds int    `json:"expires_in_seconds"`
 		}
+
+		defaultExpiresInSeconds := time.Hour
+
 		w.Header().Set("Content-Type", "application/json")
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
@@ -285,15 +305,158 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if params.ExpiresInSeconds > 0 {
+			defaultExpiresInSeconds = time.Duration(params.ExpiresInSeconds) * time.Second
+		}
+		token, err := auth.MakeJWT(user.ID, cfg.tokenSecret, defaultExpiresInSeconds)
+		refresh_token := auth.MakeRefreshToken()
+		refresh_token_expiry := time.Now().Add(60 * 24 * time.Hour)
+		tokenParams := database.CreateRefreshTokenParams{
+			Token:  refresh_token,
+			UserID: user.ID,
+			ExpiresAt: sql.NullTime{
+				Time:  refresh_token_expiry,
+				Valid: true,
+			},
+			RevokedAt: sql.NullTime{},
+		}
+		tokenData, err := cfg.db.CreateRefreshToken(r.Context(), tokenParams)
+		dat, _ := json.Marshal(userResp{
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt.Time,
+			UpdatedAt:    user.UpdatedAt.Time,
+			Email:        user.Email.String,
+			Token:        token,
+			RefreshToken: tokenData.Token,
+		})
+		w.Write(dat)
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		type respParams struct {
+			Token string `json:"token"`
+		}
+		bearerToken, err := auth.GetBearerToken(r.Header)
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		refresh_token, err := cfg.db.GetRefreshToken(r.Context(), bearerToken)
+
+		if err != nil || refresh_token.RevokedAt.Valid || refresh_token.ExpiresAt.Time.Before(time.Now()) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		user, err := cfg.db.GetUserById(r.Context(), refresh_token.UserID)
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		token, err := auth.MakeJWT(user.ID, cfg.tokenSecret, time.Hour)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		data, err := json.Marshal(respParams{
+			Token: token,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+
+	})
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		bearerToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		refresh_token, err := cfg.db.GetRefreshToken(r.Context(), bearerToken)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		err = cfg.db.RevokeRefreshToken(r.Context(), refresh_token.Token)
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	})
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		type errResp struct {
+			Error string `json:"error"`
+		}
+		bearerToken, err := auth.GetBearerToken(r.Header)
+
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		userId, err := auth.ValidateJWT(bearerToken, cfg.tokenSecret)
+
+		if err != nil {
+			w.WriteHeader(401)
+			return
+		}
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err = decoder.Decode(&params)
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+		hPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+		userData := database.UpdateUserParams{
+			ID: userId,
+			Email: sql.NullString{
+				String: params.Email,
+				Valid:  params.Email != "",
+			},
+			HashedPassword: hPassword,
+		}
+		user, err := cfg.db.UpdateUser(r.Context(), userData)
+
+		if err != nil {
+			fmt.Println(err)
+			w.WriteHeader(500)
+			return
+		}
+
 		dat, _ := json.Marshal(userResp{
 			ID:        user.ID,
 			CreatedAt: user.CreatedAt.Time,
 			UpdatedAt: user.UpdatedAt.Time,
 			Email:     user.Email.String,
 		})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
 		w.Write(dat)
-		w.WriteHeader(http.StatusOK)
 	})
+
 	return &http.Server{
 		Addr:    ":" + p,
 		Handler: mux,
@@ -303,18 +466,28 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 func main() {
 	godotenv.Load()
 	platform, ok := os.LookupEnv("PLATFORM")
-	dbURL, _ := os.LookupEnv("DB_URL")
 	if !ok {
 		log.Fatal("PLATFORM not set")
 	}
+	tokenSecret, ok := os.LookupEnv("TOKEN_SECRET")
+	if !ok {
+		log.Fatal("Token not set")
+	}
+	dbURL, ok := os.LookupEnv("DB_URL")
+
+	if !ok {
+		log.Fatal("Database Url not set")
+	}
+
 	port := "8080"
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	cfg := &apiConfig{
-		platform: platform,
-		db:       database.New(db),
+		platform:    platform,
+		db:          database.New(db),
+		tokenSecret: tokenSecret,
 	}
 	fmt.Println("Starting Server on port " + port)
 	s := newServer(port, cfg)
