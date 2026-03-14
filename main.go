@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -12,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/azs06/Chirpy/internal/auth"
-	"github.com/azs06/Chirpy/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+
+	"github.com/azs06/Chirpy/internal/database"
 )
 
 type apiConfig struct {
@@ -24,13 +23,7 @@ type apiConfig struct {
 	db             *database.Queries
 	platform       string
 	tokenSecret    string
-}
-type chirpResp struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Body      string    `json:"body"`
-	UserId    string    `json:"user_id"`
+	polkaKey       string
 }
 
 type userResp struct {
@@ -40,6 +33,15 @@ type userResp struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
+}
+
+type chirpResp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    string    `json:"user_id"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -77,385 +79,22 @@ func newServer(p string, cfg *apiConfig) *http.Server {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
-	mux.HandleFunc("GET /admin/metrics", func(w http.ResponseWriter, r *http.Request) {
-		//w.Write([]byte(fmt.Sprintf("Hits: %d", cfg.fileserverHits.Load())))
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "<html><body><h1>Welcome, Chirpy Admin</h1><p>Chirpy has been visited %d times!</p></body></html>", cfg.fileserverHits.Load())
-	})
-	mux.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
-		if cfg.platform != "dev" {
-			w.WriteHeader(http.StatusForbidden)
-			return
-		}
-		cfg.resetMetrics()
-		err := cfg.db.DeleteUsers(r.Context())
-		if err != nil {
-			w.WriteHeader(500)
-			return
-		}
-		w.Write([]byte("Metrics reset\n"))
-	})
+	mux.HandleFunc("GET /admin/metrics", cfg.handlerMetrics)
+	mux.HandleFunc("POST /admin/reset", cfg.handlerReset)
 
-	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
-		type parameters struct {
-			Body string `json:"body"`
-		}
-		type errResp struct {
-			Error string `json:"error"`
-		}
+	mux.HandleFunc("POST /api/chirps", cfg.handlerCreateChirp)
+	mux.HandleFunc("GET /api/chirps", cfg.handlerGetChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpId}", cfg.handlerGetChirpByID)
+	mux.HandleFunc("DELETE /api/chirps/{chirpId}", cfg.handlerDeleteChirp)
 
-		bearerToken, err := auth.GetBearerToken(r.Header)
+	mux.HandleFunc("POST /api/users", cfg.handlerCreateUser)
+	mux.HandleFunc("PUT /api/users", cfg.handlerUpdateUser)
 
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
+	mux.HandleFunc("POST /api/login", cfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", cfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", cfg.handlerRevoke)
 
-		userId, err := auth.ValidateJWT(bearerToken, cfg.tokenSecret)
-
-		if err != nil {
-			w.WriteHeader(401)
-			return
-		}
-
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err = decoder.Decode(&params)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			dat, _ := json.Marshal(errResp{
-				Error: "Something went wrong",
-			})
-			log.Printf("Error decoding parameters: %s", err)
-			w.WriteHeader(500)
-			w.Write(dat)
-			return
-		}
-		if len(params.Body) > 140 {
-			dat, _ := json.Marshal(errResp{
-				Error: "Chirp is too long",
-			})
-			w.WriteHeader(400)
-			w.Write(dat)
-			return
-		}
-		chirpParam := database.CreateChirpParams{
-			Body: sql.NullString{
-				String: sanitize(params.Body),
-				Valid:  true,
-			},
-			UserID: userId,
-		}
-		chirp, err := cfg.db.CreateChirp(r.Context(), chirpParam)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-
-		dat, _ := json.Marshal(chirpResp{
-			ID:        chirp.ID,
-			CreatedAt: chirp.CreatedAt.Time,
-			UpdatedAt: chirp.UpdatedAt.Time,
-			Body:      chirp.Body.String,
-			UserId:    chirp.UserID.String(),
-		})
-		w.WriteHeader(201)
-		w.Write(dat)
-	})
-	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
-		chirps, err := cfg.db.GetChirps(r.Context())
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-
-		type chirp struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Body      string    `json:"body"`
-			UserId    string    `json:"user_id"`
-		}
-		chirpResp := []chirp{}
-
-		for _, c := range chirps {
-			chirpResp = append(chirpResp, chirp{
-				ID:        c.ID,
-				CreatedAt: c.CreatedAt.Time,
-				UpdatedAt: c.UpdatedAt.Time,
-				Body:      c.Body.String,
-				UserId:    c.UserID.String(),
-			})
-		}
-		dat, _ := json.Marshal(chirpResp)
-		w.WriteHeader(200)
-		w.Write(dat)
-
-	})
-
-	mux.HandleFunc("GET /api/chirps/{chirpId}", func(w http.ResponseWriter, r *http.Request) {
-		chirpId := r.PathValue("chirpId")
-		chirpUUId, err := uuid.Parse(chirpId)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			fmt.Println(err)
-			w.Write([]byte(err.Error()))
-			w.WriteHeader(500)
-			return
-		}
-
-		chirp, err := cfg.db.GetChirpByID(r.Context(), chirpUUId)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(404)
-			w.Write([]byte(err.Error()))
-			return
-		}
-		dat, _ := json.Marshal(chirpResp{
-			ID:        chirp.ID,
-			CreatedAt: chirp.CreatedAt.Time,
-			UpdatedAt: chirp.UpdatedAt.Time,
-			Body:      chirp.Body.String,
-			UserId:    chirp.UserID.String(),
-		})
-		w.WriteHeader(200)
-		w.Write(dat)
-
-	})
-	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
-		type parameters struct {
-			Email    string `json:"email"`
-			Password string `json:"password"`
-		}
-		type errResp struct {
-			Error string `json:"error"`
-		}
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err := decoder.Decode(&params)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-		hPassword, err := auth.HashPassword(params.Password)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-		userData := database.CreateUserParams{
-			Email: sql.NullString{
-				String: params.Email,
-				Valid:  params.Email != "",
-			},
-			HashedPassword: hPassword,
-		}
-		user, err := cfg.db.CreateUser(r.Context(), userData)
-
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-
-		dat, _ := json.Marshal(userResp{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt.Time,
-			UpdatedAt: user.UpdatedAt.Time,
-			Email:     user.Email.String,
-		})
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		w.Write(dat)
-
-	})
-
-	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
-		type parameters struct {
-			Email            string `json:"email"`
-			Password         string `json:"password"`
-			ExpiresInSeconds int    `json:"expires_in_seconds"`
-		}
-
-		defaultExpiresInSeconds := time.Hour
-
-		w.Header().Set("Content-Type", "application/json")
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err := decoder.Decode(&params)
-
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-
-		user, err := cfg.db.GetUserByEmail(r.Context(), sql.NullString{
-			String: params.Email,
-			Valid:  params.Email != "",
-		})
-
-		match, err := auth.CheckHashedPassword(params.Password, user.HashedPassword)
-		if !match {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		if params.ExpiresInSeconds > 0 {
-			defaultExpiresInSeconds = time.Duration(params.ExpiresInSeconds) * time.Second
-		}
-		token, err := auth.MakeJWT(user.ID, cfg.tokenSecret, defaultExpiresInSeconds)
-		refresh_token := auth.MakeRefreshToken()
-		refresh_token_expiry := time.Now().Add(60 * 24 * time.Hour)
-		tokenParams := database.CreateRefreshTokenParams{
-			Token:  refresh_token,
-			UserID: user.ID,
-			ExpiresAt: sql.NullTime{
-				Time:  refresh_token_expiry,
-				Valid: true,
-			},
-			RevokedAt: sql.NullTime{},
-		}
-		tokenData, err := cfg.db.CreateRefreshToken(r.Context(), tokenParams)
-		dat, _ := json.Marshal(userResp{
-			ID:           user.ID,
-			CreatedAt:    user.CreatedAt.Time,
-			UpdatedAt:    user.UpdatedAt.Time,
-			Email:        user.Email.String,
-			Token:        token,
-			RefreshToken: tokenData.Token,
-		})
-		w.Write(dat)
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		type respParams struct {
-			Token string `json:"token"`
-		}
-		bearerToken, err := auth.GetBearerToken(r.Header)
-
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		refresh_token, err := cfg.db.GetRefreshToken(r.Context(), bearerToken)
-
-		if err != nil || refresh_token.RevokedAt.Valid || refresh_token.ExpiresAt.Time.Before(time.Now()) {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		user, err := cfg.db.GetUserById(r.Context(), refresh_token.UserID)
-
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		token, err := auth.MakeJWT(user.ID, cfg.tokenSecret, time.Hour)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		data, err := json.Marshal(respParams{
-			Token: token,
-		})
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(data)
-
-	})
-	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		bearerToken, err := auth.GetBearerToken(r.Header)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		refresh_token, err := cfg.db.GetRefreshToken(r.Context(), bearerToken)
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		err = cfg.db.RevokeRefreshToken(r.Context(), refresh_token.Token)
-
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-
-	})
-	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
-		type parameters struct {
-			Email    string `json:"email"`
-			Password string `json:"password"`
-		}
-		type errResp struct {
-			Error string `json:"error"`
-		}
-		bearerToken, err := auth.GetBearerToken(r.Header)
-
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		userId, err := auth.ValidateJWT(bearerToken, cfg.tokenSecret)
-
-		if err != nil {
-			w.WriteHeader(401)
-			return
-		}
-		decoder := json.NewDecoder(r.Body)
-		params := parameters{}
-		err = decoder.Decode(&params)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-		hPassword, err := auth.HashPassword(params.Password)
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-		userData := database.UpdateUserParams{
-			ID: userId,
-			Email: sql.NullString{
-				String: params.Email,
-				Valid:  params.Email != "",
-			},
-			HashedPassword: hPassword,
-		}
-		user, err := cfg.db.UpdateUser(r.Context(), userData)
-
-		if err != nil {
-			fmt.Println(err)
-			w.WriteHeader(500)
-			return
-		}
-
-		dat, _ := json.Marshal(userResp{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt.Time,
-			UpdatedAt: user.UpdatedAt.Time,
-			Email:     user.Email.String,
-		})
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		w.Write(dat)
-	})
+	mux.HandleFunc("POST /api/polka/webhooks", cfg.handlerWebhook)
 
 	return &http.Server{
 		Addr:    ":" + p,
@@ -484,10 +123,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	polkaKey := os.Getenv("POLKA_KEY")
 	cfg := &apiConfig{
 		platform:    platform,
 		db:          database.New(db),
 		tokenSecret: tokenSecret,
+		polkaKey:    polkaKey,
 	}
 	fmt.Println("Starting Server on port " + port)
 	s := newServer(port, cfg)
